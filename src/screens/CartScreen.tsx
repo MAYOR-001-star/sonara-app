@@ -28,11 +28,9 @@ export const CartScreen: React.FC<CartScreenProps> = ({
     subtotal,
     grandTotal,
     isRealtimeConnected,
-    lastSyncedAt,
     updateQuantity,
     removeItem,
     clearCart,
-    syncNow,
   } = useCart();
 
   const getProductImage = (id: string) => {
@@ -47,8 +45,35 @@ export const CartScreen: React.FC<CartScreenProps> = ({
     <View style={styles.container}>
       {/* Top Header */}
       <View style={styles.header}>
-        <View>
+        <View style={styles.headerLeft}>
           <Text style={styles.title}>Cart ({count})</Text>
+          <View
+            style={[
+              styles.syncBadge,
+              isRealtimeConnected
+                ? styles.syncBadgeConnected
+                : styles.syncBadgeConnecting,
+            ]}
+          >
+            <View
+              style={[
+                styles.syncDot,
+                isRealtimeConnected
+                  ? styles.syncDotConnected
+                  : styles.syncDotConnecting,
+              ]}
+            />
+            <Text
+              style={[
+                styles.syncBadgeText,
+                isRealtimeConnected
+                  ? styles.syncTextConnected
+                  : styles.syncTextConnecting,
+              ]}
+            >
+              {isRealtimeConnected ? "Live Sync" : "Syncing"}
+            </Text>
+          </View>
         </View>
 
         <View style={styles.headerRight}>
@@ -175,6 +200,53 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
     borderBottomWidth: 1,
     borderBottomColor: colors.tan,
+  },
+  headerLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  syncBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 12,
+    gap: 5,
+  },
+  syncBadgeConnected: {
+    backgroundColor: "#ecfdf5",
+    borderWidth: 1,
+    borderColor: "#a7f3d0",
+  },
+  syncBadgeConnecting: {
+    backgroundColor: "#fffbeb",
+    borderWidth: 1,
+    borderColor: "#fde68a",
+  },
+  syncDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  syncDotConnected: {
+    backgroundColor: "#10b981",
+  },
+  syncDotConnecting: {
+    backgroundColor: "#f59e0b",
+  },
+  syncBadgeText: {
+    fontFamily: fonts.sans,
+    fontSize: 9,
+    fontWeight: "700",
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+  },
+  syncTextConnected: {
+    color: "#065f46",
+  },
+  syncTextConnecting: {
+    color: "#92400e",
   },
   title: {
     fontFamily: fonts.display,
