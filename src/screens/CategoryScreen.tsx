@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState, useEffect } from "react";
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import { Image } from "expo-image";
 import { colors } from "../theme/colors";
 import { fonts } from "../theme/typography";
 import { seedProducts, storeArt } from "../services/seed-data";
+import { api } from "../services/api";
 import type { Product, Category } from "../types";
 
 interface CategoryScreenProps {
@@ -25,7 +26,38 @@ export const CategoryScreen: React.FC<CategoryScreenProps> = ({
   onSelectProduct,
   onSelectCategory,
 }) => {
-  const categoryProducts = seedProducts.filter((p) => p.category === category);
+  const [products, setProducts] = useState<Product[]>(
+    seedProducts.filter((p) => p.category === category)
+  );
+
+  useEffect(() => {
+    let mounted = true;
+    const fetchCategoryProducts = async () => {
+      try {
+        const live = await api.getProducts(category);
+        if (mounted && live && live.length > 0) {
+          setProducts(live);
+        }
+      } catch {
+        // Fallback
+      }
+    };
+
+    fetchCategoryProducts();
+
+    const unsubscribe = api.subscribeToProducts(() => {
+      fetchCategoryProducts();
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, [category]);
+
+  const categoryProducts = products.length > 0
+    ? products
+    : seedProducts.filter((p) => p.category === category);
   const featured = categoryProducts[0];
   const rest = categoryProducts.slice(1);
 

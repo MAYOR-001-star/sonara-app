@@ -35,13 +35,34 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   const [confirmPassword, setConfirmPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
-  const { signIn, signUp, resetPassword } = useAuth();
+  const { signIn, signUp, resetPassword, signInWithGoogle } = useAuth();
 
   const isSignUp = mode === "signup";
   const isForgot = mode === "forgot";
+
+  const handleGoogleSignIn = async () => {
+    setError(null);
+    setMessage(null);
+    setGoogleLoading(true);
+    try {
+      const res = await signInWithGoogle();
+      if (res.ok) {
+        onSuccess();
+      } else if (res.error && res.error !== "Sign in was cancelled.") {
+        setError(res.error);
+      }
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error ? err.message : "Google sign-in failed";
+      setError(msg);
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
 
   const handleSubmit = async () => {
     setError(null);
@@ -330,26 +351,33 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
 
               {/* Google Button */}
               <TouchableOpacity
-                style={styles.googleBtn}
+                style={[
+                  styles.googleBtn,
+                  (loading || googleLoading) && { opacity: 0.7 },
+                ]}
                 activeOpacity={0.85}
-                onPress={() => {
-                  setError("Google sign-in is managed via your web browser session.");
-                }}
+                disabled={loading || googleLoading}
+                onPress={handleGoogleSignIn}
               >
-                <Ionicons name="logo-google" size={18} color="#EA4335" />
-                <Text style={styles.googleBtnText}>
-                  {isSignUp ? "Sign up with Google" : "Sign in with Google"}
-                </Text>
+                {googleLoading ? (
+                  <ActivityIndicator size="small" color="#EA4335" />
+                ) : (
+                  <>
+                    <Ionicons name="logo-google" size={18} color="#EA4335" />
+                    <Text style={styles.googleBtnText}>
+                      {isSignUp ? "Sign up with Google" : "Sign in with Google"}
+                    </Text>
+                  </>
+                )}
               </TouchableOpacity>
             </>
           )}
 
-          {/* Terms & Privacy note matching web */}
+          {/* Terms & Privacy note */}
           <Text style={styles.termsText}>
             By continuing, you agree to our{" "}
             <Text style={styles.termsLink}>Terms of Service</Text> and{" "}
-            <Text style={styles.termsLink}>Privacy Policy</Text>. We never see
-            or store your Google password.
+            <Text style={styles.termsLink}>Privacy Policy</Text>.
           </Text>
         </View>
       </ScrollView>

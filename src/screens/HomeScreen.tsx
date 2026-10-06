@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState, useEffect } from "react";
 import {
   View,
   Text,
@@ -11,6 +11,7 @@ import { Image } from "expo-image";
 import { colors } from "../theme/colors";
 import { fonts } from "../theme/typography";
 import { storeArt, categoryArt, seedProducts } from "../services/seed-data";
+import { api } from "../services/api";
 import { useCart } from "../context/CartContext";
 import type { Product, Category } from "../types";
 
@@ -26,11 +27,37 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onSelectCategory,
 }) => {
   const { addItem } = useCart();
+  const [products, setProducts] = useState<Product[]>(seedProducts);
 
-  const heroProduct = seedProducts[0]; // XX99 Mark II
-  const featured = seedProducts.slice(1, 4); // XX99 Mark I, XX59, ZX9
-  const zx9 = seedProducts.find((p) => p.id === "p-zx9-speaker") || seedProducts[3];
-  const zx7 = seedProducts.find((p) => p.id === "p-zx7-speaker") || seedProducts[4];
+  useEffect(() => {
+    let mounted = true;
+    const fetchLiveProducts = async () => {
+      try {
+        const live = await api.getProducts();
+        if (mounted && live && live.length > 0) {
+          setProducts(live);
+        }
+      } catch {
+        // Fallback to seedProducts
+      }
+    };
+
+    fetchLiveProducts();
+
+    const unsubscribe = api.subscribeToProducts(() => {
+      fetchLiveProducts();
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
+
+  const heroProduct = products[0] || seedProducts[0];
+  const featured = products.slice(1, 4);
+  const zx9 = products.find((p) => p.slug.includes("zx9") || p.id.includes("zx9")) || seedProducts[3];
+  const zx7 = products.find((p) => p.slug.includes("zx7") || p.id.includes("zx7")) || seedProducts[4];
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>

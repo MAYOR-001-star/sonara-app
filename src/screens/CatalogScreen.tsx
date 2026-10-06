@@ -56,6 +56,14 @@ export const CatalogScreen: React.FC<CatalogScreenProps> = ({
 
   useEffect(() => {
     loadProducts();
+
+    const unsubscribe = api.subscribeToProducts(() => {
+      loadProducts();
+    });
+
+    return () => {
+      unsubscribe();
+    };
   }, []);
 
   const handleRefresh = async () => {

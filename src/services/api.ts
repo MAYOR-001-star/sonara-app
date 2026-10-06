@@ -181,6 +181,8 @@ export const api = {
               }))
             );
           }
+          // Clear cart_items table in Supabase
+          await supabase.from("cart_items").delete().eq("user_id", user.id);
         }
       } catch (insertErr) {
         console.warn("[checkout] Supabase direct write error:", insertErr);
@@ -321,6 +323,28 @@ export const api = {
           schema: "public",
           table: "orders",
           filter: `user_id=eq.${userId}`,
+        },
+        () => {
+          onUpdate();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  },
+
+  // Real-time subscription to products table
+  subscribeToProducts(onUpdate: () => void) {
+    const channel = supabase
+      .channel("public_products_changes")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "products",
         },
         () => {
           onUpdate();

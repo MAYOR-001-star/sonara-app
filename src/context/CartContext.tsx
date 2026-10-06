@@ -1,6 +1,4 @@
-import React, { createContext, useContext, useEffect, useRef, useState, useMemo } from "react";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Platform } from "react-native";
+import React, { createContext, useContext, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { supabase } from "../services/supabase";
 import { useAuth } from "./AuthContext";
 import type { CartLine, Product } from "../types";
@@ -15,41 +13,11 @@ interface CartContextType {
   grandTotal: number;
   isRealtimeConnected: boolean;
   lastSyncedAt: Date | null;
-  addItem: (product: Product | Omit<CartLine, "quantity">, quantity?: number) => void;
-  removeItem: (id: string) => void;
-  updateQuantity: (id: string, quantity: number) => void;
-  clearCart: () => void;
-  syncNow: () => void;
-}
-
-// Matches the exact storage key used by the shop website (hng stage 2/src/store/cart-store.ts)
-const WEB_CART_STORAGE_KEY = "audiophile-cart";
-const MOBILE_STORAGE_KEY = "@sonora_mobile_cart";
-
-function parseCartLines(raw: string | null): CartLine[] | null {
-  if (!raw) return null;
-  try {
-    const data = JSON.parse(raw);
-    // Zustand persist wrapper format: { state: { lines: [...] }, version: 0 }
-    if (data?.state?.lines && Array.isArray(data.state.lines)) {
-      return data.state.lines;
-    }
-    // Direct array format
-    if (Array.isArray(data)) {
-      return data;
-    }
-  } catch {
-    // Ignore parse error
-  }
-  return null;
-}
-
-function serializeCartLines(lines: CartLine[]): string {
-  // Save in Zustand persist middleware format so the website reads it seamlessly
-  return JSON.stringify({
-    state: { lines },
-    version: 0,
-  });
+  addItem: (product: Product | Omit<CartLine, "quantity">, quantity?: number) => Promise<void>;
+  removeItem: (id: string) => Promise<void>;
+  updateQuantity: (id: string, quantity: number) => Promise<void>;
+  clearCart: () => Promise<void>;
+  syncNow: () => Promise<void>;
 }
 
 const CartContext = createContext<CartContextType | undefined>(undefined);
@@ -58,83 +26,73 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const { user } = useAuth();
   const [lines, setLines] = useState<CartLine[]>([]);
   const [isRealtimeConnected, setIsRealtimeConnected] = useState(true);
-  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(new Date());
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
 
   const channelRef = useRef<RealtimeChannel | null>(null);
-  const lastRawRef = useRef<string | null>(null);
 
-  // 1. Initial cart load & continuous localStorage sync with website
-  useEffect(() => {
-    const checkWebCart = () => {
-      if (Platform.OS === "web" && typeof window !== "undefined" && window.localStorage) {
-        const raw = window.localStorage.getItem(WEB_CART_STORAGE_KEY);
-        if (raw && raw !== lastRawRef.current) {
-          lastRawRef.current = raw;
-          const parsed = parseCartLines(raw);
-          if (parsed) {
-            setLines(parsed);
-            setLastSyncedAt(new Date());
-          }
-        }
+  // 1. Fetch cart directly from Supabase "cart_items" table for the logged-in user
+  const fetchCartFromDatabase = useCallback(async (userId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from("cart_items")
+        .select("*")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: true });
+
+      if (error) {
+        console.warn("[CartContext] Error fetching from cart_items table:", error.message);
+        return;
       }
-    };
 
-    // Immediate check
-    checkWebCart();
-
-    // Check async storage for native mobile
-    if (Platform.OS !== "web") {
-      AsyncStorage.getItem(MOBILE_STORAGE_KEY).then((raw) => {
-        const parsed = parseCartLines(raw);
-        if (parsed) {
-          setLines(parsed);
-          setLastSyncedAt(new Date());
-        }
-      });
-    }
-
-    // On Web: poll and listen to window storage event for instant cross-tab / website sync
-    let interval: ReturnType<typeof setInterval> | null = null;
-    let handleStorage: ((e: StorageEvent) => void) | null = null;
-
-    if (Platform.OS === "web" && typeof window !== "undefined") {
-      // Storage event triggers instantly when another tab / website window mutates localStorage
-      handleStorage = (e: StorageEvent) => {
-        if (e.key === WEB_CART_STORAGE_KEY && e.newValue) {
-          lastRawRef.current = e.newValue;
-          const parsed = parseCartLines(e.newValue);
-          if (parsed) {
-            setLines(parsed);
-            setLastSyncedAt(new Date());
-          }
-        }
-      };
-      window.addEventListener("storage", handleStorage);
-
-      // Fast interval polling ensures instant appearance even without cross-tab storage event
-      interval = setInterval(checkWebCart, 400);
-    }
-
-    return () => {
-      if (interval) clearInterval(interval);
-      if (handleStorage && typeof window !== "undefined") {
-        window.removeEventListener("storage", handleStorage);
+      if (data) {
+        const mappedLines: CartLine[] = data.map((row) => ({
+          id: row.product_id,
+          name: row.product_name,
+          slug: row.product_slug || row.product_id,
+          price: Number(row.unit_price),
+          quantity: Number(row.quantity),
+          accent: (row.accent as "peach" | "mist" | "ink") || "peach",
+        }));
+        setLines(mappedLines);
+        setLastSyncedAt(new Date());
       }
-    };
+    } catch (err) {
+      console.warn("[CartContext] Database fetch failed:", err);
+    }
   }, []);
 
-  // 2. Realtime Broadcast channel via Supabase for remote / cross-device synchronization
+  // 2. React to Auth changes: load DB cart when user signs in, wipe state on sign out
   useEffect(() => {
-    const channelName = user?.id ? `cart_sync_${user.id}` : `audiophile-cart-sync`;
-    const channel = supabase.channel(channelName);
+    if (!user?.id) {
+      // User is logged out — empty in-memory cart (no local storage!)
+      setLines([]);
+      setLastSyncedAt(null);
+      return;
+    }
 
-    channel
-      .on("broadcast", { event: "cart_updated" }, ({ payload }) => {
-        if (payload?.lines && Array.isArray(payload.lines)) {
-          setLines(payload.lines);
-          setLastSyncedAt(new Date());
+    fetchCartFromDatabase(user.id);
+  }, [user?.id, fetchCartFromDatabase]);
+
+  // 3. Supabase Realtime: subscribe directly to postgres_changes on "cart_items" table
+  useEffect(() => {
+    if (!user?.id) return;
+
+    const channelName = `cart_items_realtime_${user.id}`;
+    const channel = supabase
+      .channel(channelName)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "cart_items",
+          filter: `user_id=eq.${user.id}`,
+        },
+        () => {
+          // Re-fetch cart whenever a row is inserted, updated, or deleted
+          fetchCartFromDatabase(user.id);
         }
-      })
+      )
       .subscribe((status) => {
         setIsRealtimeConnected(status === "SUBSCRIBED");
       });
@@ -147,88 +105,162 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         channelRef.current = null;
       }
     };
-  }, [user?.id]);
+  }, [user?.id, fetchCartFromDatabase]);
 
-  // 3. Helper to write back to website localStorage and broadcast
-  const saveAndBroadcast = (updatedLines: CartLine[]) => {
-    const serialized = serializeCartLines(updatedLines);
-    lastRawRef.current = serialized;
+  // 4. Add item -> Upsert directly to Supabase "cart_items" table
+  const addItem = async (product: Product | Omit<CartLine, "quantity">, quantity = 1) => {
+    const qty = Math.min(10, Math.max(1, quantity));
 
-    // Save to website's localStorage key
-    if (Platform.OS === "web" && typeof window !== "undefined" && window.localStorage) {
-      window.localStorage.setItem(WEB_CART_STORAGE_KEY, serialized);
-    } else {
-      AsyncStorage.setItem(MOBILE_STORAGE_KEY, serialized).catch(() => {});
-    }
-
-    // Broadcast via Supabase Realtime
-    if (channelRef.current) {
-      channelRef.current.send({
-        type: "broadcast",
-        event: "cart_updated",
-        payload: { lines: updatedLines, timestamp: Date.now() },
+    if (!user?.id) {
+      // If not logged in, maintain in-memory only (never saved to local storage)
+      setLines((prev) => {
+        const existing = prev.find((l) => l.id === product.id);
+        if (existing) {
+          return prev.map((l) =>
+            l.id === product.id ? { ...l, quantity: Math.min(10, l.quantity + qty) } : l
+          );
+        }
+        return [
+          ...prev,
+          {
+            id: product.id,
+            slug: product.slug,
+            name: product.name,
+            price: product.price,
+            quantity: qty,
+            accent: product.accent || "peach",
+          },
+        ];
       });
+      return;
     }
 
-    setLastSyncedAt(new Date());
-  };
+    // Optimistic in-memory update
+    const existing = lines.find((l) => l.id === product.id);
+    const targetQty = existing ? Math.min(10, existing.quantity + qty) : qty;
 
-  const addItem = (product: Product | Omit<CartLine, "quantity">, quantity = 1) => {
     setLines((prev) => {
-      const existing = prev.find((l) => l.id === product.id);
-      let updated: CartLine[];
       if (existing) {
-        updated = prev.map((l) =>
-          l.id === product.id ? { ...l, quantity: Math.min(10, l.quantity + quantity) } : l
-        );
-      } else {
-        const newLine: CartLine = {
+        return prev.map((l) => (l.id === product.id ? { ...l, quantity: targetQty } : l));
+      }
+      return [
+        ...prev,
+        {
           id: product.id,
           slug: product.slug,
           name: product.name,
           price: product.price,
-          quantity: Math.min(10, quantity),
+          quantity: targetQty,
           accent: product.accent || "peach",
-        };
-        updated = [...prev, newLine];
-      }
-
-      saveAndBroadcast(updated);
-      return updated;
+        },
+      ];
     });
-  };
 
-  const removeItem = (id: string) => {
-    setLines((prev) => {
-      const updated = prev.filter((l) => l.id !== id);
-      saveAndBroadcast(updated);
-      return updated;
-    });
-  };
-
-  const updateQuantity = (id: string, quantity: number) => {
-    setLines((prev) => {
-      const updated = prev.map((l) =>
-        l.id === id ? { ...l, quantity: Math.max(1, Math.min(10, quantity)) } : l
+    // Write directly to Supabase database table
+    try {
+      const { error } = await supabase.from("cart_items").upsert(
+        {
+          user_id: user.id,
+          product_id: product.id,
+          product_name: product.name,
+          product_slug: product.slug || product.id,
+          unit_price: product.price,
+          quantity: targetQty,
+          accent: product.accent || "peach",
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id,product_id" }
       );
-      saveAndBroadcast(updated);
-      return updated;
-    });
-  };
 
-  const clearCart = () => {
-    setLines([]);
-    saveAndBroadcast([]);
-  };
-
-  const syncNow = () => {
-    if (Platform.OS === "web" && typeof window !== "undefined" && window.localStorage) {
-      const raw = window.localStorage.getItem(WEB_CART_STORAGE_KEY);
-      const parsed = parseCartLines(raw);
-      if (parsed) {
-        setLines(parsed);
+      if (error) {
+        console.warn("[CartContext] Upsert into cart_items failed:", error.message);
+      } else {
         setLastSyncedAt(new Date());
       }
+    } catch (err) {
+      console.warn("[CartContext] Upsert network error:", err);
+    }
+  };
+
+  // 5. Remove item -> Delete from Supabase "cart_items" table
+  const removeItem = async (id: string) => {
+    // Optimistic update
+    setLines((prev) => prev.filter((l) => l.id !== id));
+
+    if (!user?.id) return;
+
+    try {
+      const { error } = await supabase
+        .from("cart_items")
+        .delete()
+        .eq("user_id", user.id)
+        .eq("product_id", id);
+
+      if (error) {
+        console.warn("[CartContext] Delete from cart_items failed:", error.message);
+      } else {
+        setLastSyncedAt(new Date());
+      }
+    } catch (err) {
+      console.warn("[CartContext] Delete network error:", err);
+    }
+  };
+
+  // 6. Update quantity -> Update in Supabase "cart_items" table
+  const updateQuantity = async (id: string, quantity: number) => {
+    const clampedQty = Math.max(1, Math.min(10, quantity));
+
+    // Optimistic update
+    setLines((prev) =>
+      prev.map((l) => (l.id === id ? { ...l, quantity: clampedQty } : l))
+    );
+
+    if (!user?.id) return;
+
+    try {
+      const { error } = await supabase
+        .from("cart_items")
+        .update({
+          quantity: clampedQty,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("user_id", user.id)
+        .eq("product_id", id);
+
+      if (error) {
+        console.warn("[CartContext] Update quantity in cart_items failed:", error.message);
+      } else {
+        setLastSyncedAt(new Date());
+      }
+    } catch (err) {
+      console.warn("[CartContext] Update quantity network error:", err);
+    }
+  };
+
+  // 7. Clear cart -> Delete all user's rows from Supabase "cart_items" table
+  const clearCart = async () => {
+    setLines([]);
+
+    if (!user?.id) return;
+
+    try {
+      await supabase
+        .from("cart_items")
+        .delete()
+        .eq("user_id", user.id);
+
+      // Clean up any legacy auth user_metadata cart
+      await supabase.auth.updateUser({ data: { cart: null } });
+      setLastSyncedAt(new Date());
+    } catch (err) {
+      console.warn("[CartContext] Clear network error:", err);
+    }
+  };
+
+  // 8. Manual sync trigger
+  const syncNow = async () => {
+    if (user?.id) {
+      await fetchCartFromDatabase(user.id);
     }
   };
 
