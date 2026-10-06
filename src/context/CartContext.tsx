@@ -30,7 +30,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const channelRef = useRef<RealtimeChannel | null>(null);
 
-  // 1. Fetch cart directly from Supabase "cart_items" table for the logged-in user
+  // 1. Fetch cart directly from Supabase "cart_items" table
   const fetchCartFromDatabase = useCallback(async (userId: string) => {
     try {
       const { data, error } = await supabase
@@ -40,7 +40,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         .order("created_at", { ascending: true });
 
       if (error) {
-        console.warn("[CartContext] Error fetching from cart_items table:", error.message);
+        console.error("[CartContext] Error fetching from cart_items table:", error.message);
         return;
       }
 
@@ -57,14 +57,13 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setLastSyncedAt(new Date());
       }
     } catch (err) {
-      console.warn("[CartContext] Database fetch failed:", err);
+      console.error("[CartContext] Database fetch failed:", err);
     }
   }, []);
 
-  // 2. React to Auth changes: load DB cart when user signs in, wipe state on sign out
+  // 2. Auth changes: load DB cart when user signs in, wipe on sign out
   useEffect(() => {
     if (!user?.id) {
-      // User is logged out — empty in-memory cart (no local storage!)
       setLines([]);
       setLastSyncedAt(null);
       return;
@@ -73,24 +72,23 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     fetchCartFromDatabase(user.id);
   }, [user?.id, fetchCartFromDatabase]);
 
-  // 3. Supabase Realtime: subscribe directly to postgres_changes on "cart_items" table
+  // 3. Shared Realtime subscription on cart_items table
   useEffect(() => {
     if (!user?.id) return;
 
-    const channelName = `cart_items_realtime_${user.id}`;
     const channel = supabase
-      .channel(channelName)
+      .channel("cart_items_realtime_shared")
       .on(
         "postgres_changes",
         {
           event: "*",
           schema: "public",
           table: "cart_items",
-          filter: `user_id=eq.${user.id}`,
         },
         () => {
-          // Re-fetch cart whenever a row is inserted, updated, or deleted
-          fetchCartFromDatabase(user.id);
+          if (user?.id) {
+            fetchCartFromDatabase(user.id);
+          }
         }
       )
       .subscribe((status) => {
@@ -112,7 +110,6 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const qty = Math.min(10, Math.max(1, quantity));
 
     if (!user?.id) {
-      // If not logged in, maintain in-memory only (never saved to local storage)
       setLines((prev) => {
         const existing = prev.find((l) => l.id === product.id);
         if (existing) {
@@ -156,7 +153,6 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ];
     });
 
-    // Write directly to Supabase database table
     try {
       const { error } = await supabase.from("cart_items").upsert(
         {
@@ -173,18 +169,17 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       );
 
       if (error) {
-        console.warn("[CartContext] Upsert into cart_items failed:", error.message);
+        console.error("[CartContext] Upsert into cart_items failed:", error.message);
       } else {
         setLastSyncedAt(new Date());
       }
     } catch (err) {
-      console.warn("[CartContext] Upsert network error:", err);
+      console.error("[CartContext] Upsert network error:", err);
     }
   };
 
   // 5. Remove item -> Delete from Supabase "cart_items" table
   const removeItem = async (id: string) => {
-    // Optimistic update
     setLines((prev) => prev.filter((l) => l.id !== id));
 
     if (!user?.id) return;
@@ -197,12 +192,12 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         .eq("product_id", id);
 
       if (error) {
-        console.warn("[CartContext] Delete from cart_items failed:", error.message);
+        console.error("[CartContext] Delete failed:", error.message);
       } else {
         setLastSyncedAt(new Date());
       }
     } catch (err) {
-      console.warn("[CartContext] Delete network error:", err);
+      console.error("[CartContext] Delete network error:", err);
     }
   };
 
@@ -210,7 +205,6 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const updateQuantity = async (id: string, quantity: number) => {
     const clampedQty = Math.max(1, Math.min(10, quantity));
 
-    // Optimistic update
     setLines((prev) =>
       prev.map((l) => (l.id === id ? { ...l, quantity: clampedQty } : l))
     );
@@ -228,12 +222,12 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         .eq("product_id", id);
 
       if (error) {
-        console.warn("[CartContext] Update quantity in cart_items failed:", error.message);
+        console.error("[CartContext] Update quantity failed:", error.message);
       } else {
         setLastSyncedAt(new Date());
       }
     } catch (err) {
-      console.warn("[CartContext] Update quantity network error:", err);
+      console.error("[CartContext] Update quantity network error:", err);
     }
   };
 
@@ -244,16 +238,18 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!user?.id) return;
 
     try {
-      await supabase
+      const { error } = await supabase
         .from("cart_items")
         .delete()
         .eq("user_id", user.id);
 
-      // Clean up any legacy auth user_metadata cart
-      await supabase.auth.updateUser({ data: { cart: null } });
-      setLastSyncedAt(new Date());
+      if (error) {
+        console.error("[CartContext] Clear failed:", error.message);
+      } else {
+        setLastSyncedAt(new Date());
+      }
     } catch (err) {
-      console.warn("[CartContext] Clear network error:", err);
+      console.error("[CartContext] Clear network error:", err);
     }
   };
 
