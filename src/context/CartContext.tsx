@@ -22,15 +22,28 @@ interface CartContextType {
 
 const CartContext = createContext<CartContextType | undefined>(undefined);
 
+const WEBSOCKET_CHANNEL = "audiophile_cart_websocket_sync";
+
 export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user } = useAuth();
   const [lines, setLines] = useState<CartLine[]>([]);
-  const [isRealtimeConnected, setIsRealtimeConnected] = useState(true);
+  const [isRealtimeConnected, setIsRealtimeConnected] = useState(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
 
   const channelRef = useRef<RealtimeChannel | null>(null);
 
-  // 1. Fetch cart directly from Supabase "cart_items" table
+  // Send cart over WebSocket to other devices
+  const broadcastCart = useCallback((updatedLines: CartLine[]) => {
+    if (channelRef.current) {
+      channelRef.current.send({
+        type: "broadcast",
+        event: "cart_sync",
+        payload: { lines: updatedLines },
+      });
+    }
+  }, []);
+
+  // 1. Fetch from database on startup/login
   const fetchCartFromDatabase = useCallback(async (userId: string) => {
     try {
       const { data, error } = await supabase
@@ -39,12 +52,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         .eq("user_id", userId)
         .order("created_at", { ascending: true });
 
-      if (error) {
-        console.error("[CartContext] Error fetching from cart_items table:", error.message);
-        return;
-      }
-
-      if (data) {
+      if (!error && data && data.length > 0) {
         const mappedLines: CartLine[] = data.map((row) => ({
           id: row.product_id,
           name: row.product_name,
@@ -56,41 +64,31 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setLines(mappedLines);
         setLastSyncedAt(new Date());
       }
-    } catch (err) {
-      console.error("[CartContext] Database fetch failed:", err);
+    } catch {
+      // Ignore initial fetch errors
     }
   }, []);
 
-  // 2. Auth changes: load DB cart when user signs in, wipe on sign out
+  // 2. React to Auth changes
   useEffect(() => {
-    if (!user?.id) {
-      setLines([]);
-      setLastSyncedAt(null);
-      return;
+    if (user?.id) {
+      fetchCartFromDatabase(user.id);
     }
-
-    fetchCartFromDatabase(user.id);
   }, [user?.id, fetchCartFromDatabase]);
 
-  // 3. Shared Realtime subscription on cart_items table
+  // 3. Connect to Supabase WebSocket channel
   useEffect(() => {
-    if (!user?.id) return;
+    const channel = supabase.channel(WEBSOCKET_CHANNEL, {
+      config: { broadcast: { self: false } },
+    });
 
-    const channel = supabase
-      .channel("cart_items_realtime_shared")
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "cart_items",
-        },
-        () => {
-          if (user?.id) {
-            fetchCartFromDatabase(user.id);
-          }
+    channel
+      .on("broadcast", { event: "cart_sync" }, ({ payload }) => {
+        if (payload?.lines && Array.isArray(payload.lines)) {
+          setLines(payload.lines);
+          setLastSyncedAt(new Date());
         }
-      )
+      })
       .subscribe((status) => {
         setIsRealtimeConnected(status === "SUBSCRIBED");
       });
@@ -103,21 +101,21 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         channelRef.current = null;
       }
     };
-  }, [user?.id, fetchCartFromDatabase]);
+  }, []);
 
-  // 4. Add item -> Upsert directly to Supabase "cart_items" table
+  // 4. Add item
   const addItem = async (product: Product | Omit<CartLine, "quantity">, quantity = 1) => {
     const qty = Math.min(10, Math.max(1, quantity));
 
-    if (!user?.id) {
-      setLines((prev) => {
-        const existing = prev.find((l) => l.id === product.id);
-        if (existing) {
-          return prev.map((l) =>
-            l.id === product.id ? { ...l, quantity: Math.min(10, l.quantity + qty) } : l
-          );
-        }
-        return [
+    setLines((prev) => {
+      const existing = prev.find((l) => l.id === product.id);
+      let updated: CartLine[];
+      if (existing) {
+        updated = prev.map((l) =>
+          l.id === product.id ? { ...l, quantity: Math.min(10, l.quantity + qty) } : l
+        );
+      } else {
+        updated = [
           ...prev,
           {
             id: product.id,
@@ -128,129 +126,111 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
             accent: product.accent || "peach",
           },
         ];
-      });
-      return;
-    }
-
-    // Optimistic in-memory update
-    const existing = lines.find((l) => l.id === product.id);
-    const targetQty = existing ? Math.min(10, existing.quantity + qty) : qty;
-
-    setLines((prev) => {
-      if (existing) {
-        return prev.map((l) => (l.id === product.id ? { ...l, quantity: targetQty } : l));
       }
-      return [
-        ...prev,
-        {
-          id: product.id,
-          slug: product.slug,
-          name: product.name,
-          price: product.price,
-          quantity: targetQty,
-          accent: product.accent || "peach",
-        },
-      ];
+
+      // 1. Broadcast immediately over WebSocket
+      broadcastCart(updated);
+
+      // 2. Persist to database in background
+      if (user?.id) {
+        const itemToSave = updated.find((l) => l.id === product.id);
+        if (itemToSave) {
+          supabase
+            .from("cart_items")
+            .upsert(
+              {
+                user_id: user.id,
+                product_id: itemToSave.id,
+                product_name: itemToSave.name,
+                product_slug: itemToSave.slug || itemToSave.id,
+                unit_price: itemToSave.price,
+                quantity: itemToSave.quantity,
+                accent: itemToSave.accent || "peach",
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: "user_id,product_id" }
+            )
+            .then(() => {});
+        }
+      }
+
+      return updated;
     });
 
-    try {
-      const { error } = await supabase.from("cart_items").upsert(
-        {
-          user_id: user.id,
-          product_id: product.id,
-          product_name: product.name,
-          product_slug: product.slug || product.id,
-          unit_price: product.price,
-          quantity: targetQty,
-          accent: product.accent || "peach",
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "user_id,product_id" }
-      );
-
-      if (error) {
-        console.error("[CartContext] Upsert into cart_items failed:", error.message);
-      } else {
-        setLastSyncedAt(new Date());
-      }
-    } catch (err) {
-      console.error("[CartContext] Upsert network error:", err);
-    }
+    setLastSyncedAt(new Date());
   };
 
-  // 5. Remove item -> Delete from Supabase "cart_items" table
+  // 5. Remove item
   const removeItem = async (id: string) => {
-    setLines((prev) => prev.filter((l) => l.id !== id));
+    setLines((prev) => {
+      const updated = prev.filter((l) => l.id !== id);
 
-    if (!user?.id) return;
+      // 1. Broadcast immediately over WebSocket
+      broadcastCart(updated);
 
-    try {
-      const { error } = await supabase
-        .from("cart_items")
-        .delete()
-        .eq("user_id", user.id)
-        .eq("product_id", id);
-
-      if (error) {
-        console.error("[CartContext] Delete failed:", error.message);
-      } else {
-        setLastSyncedAt(new Date());
+      // 2. Delete from database in background
+      if (user?.id) {
+        supabase
+          .from("cart_items")
+          .delete()
+          .eq("user_id", user.id)
+          .eq("product_id", id)
+          .then(() => {});
       }
-    } catch (err) {
-      console.error("[CartContext] Delete network error:", err);
-    }
+
+      return updated;
+    });
+
+    setLastSyncedAt(new Date());
   };
 
-  // 6. Update quantity -> Update in Supabase "cart_items" table
+  // 6. Update quantity
   const updateQuantity = async (id: string, quantity: number) => {
     const clampedQty = Math.max(1, Math.min(10, quantity));
 
-    setLines((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, quantity: clampedQty } : l))
-    );
+    setLines((prev) => {
+      const updated = prev.map((l) => (l.id === id ? { ...l, quantity: clampedQty } : l));
 
-    if (!user?.id) return;
+      // 1. Broadcast immediately over WebSocket
+      broadcastCart(updated);
 
-    try {
-      const { error } = await supabase
-        .from("cart_items")
-        .update({
-          quantity: clampedQty,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("user_id", user.id)
-        .eq("product_id", id);
-
-      if (error) {
-        console.error("[CartContext] Update quantity failed:", error.message);
-      } else {
-        setLastSyncedAt(new Date());
+      // 2. Update in database in background
+      if (user?.id) {
+        supabase
+          .from("cart_items")
+          .update({
+            quantity: clampedQty,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("user_id", user.id)
+          .eq("product_id", id)
+          .then(() => {});
       }
-    } catch (err) {
-      console.error("[CartContext] Update quantity network error:", err);
-    }
+
+      return updated;
+    });
+
+    setLastSyncedAt(new Date());
   };
 
-  // 7. Clear cart -> Delete all user's rows from Supabase "cart_items" table
+  // 7. Clear cart
   const clearCart = async () => {
+    // 1. Immediate local clear
     setLines([]);
 
-    if (!user?.id) return;
+    // 2. Broadcast empty cart immediately over WebSocket
+    broadcastCart([]);
 
-    try {
-      const { error } = await supabase
+    // 3. Clear database table in background
+    if (user?.id) {
+      supabase
         .from("cart_items")
         .delete()
-        .eq("user_id", user.id);
-
-      if (error) {
-        console.error("[CartContext] Clear failed:", error.message);
-      } else {
-        setLastSyncedAt(new Date());
-      }
-    } catch (err) {
-      console.error("[CartContext] Clear network error:", err);
+        .eq("user_id", user.id)
+        .then(() => {});
     }
+
+    setLastSyncedAt(new Date());
   };
 
   // 8. Manual sync trigger
